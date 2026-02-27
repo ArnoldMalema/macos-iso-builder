@@ -1,4 +1,4 @@
-name: Split an Existing Artifact into Multiple Artifacts
+name: Split Artifact
 
 on:
   workflow_dispatch:
