@@ -1,105 +1,52 @@
-name: Split & Upload Large Artifact
+name: Download, Split, and Reupload Artifact
 
 on:
   workflow_dispatch:
     inputs:
-      file_path:
-        description: "Path to the large file to split (e.g., build/macos_Monterey_12.7.6.iso)"
+      run_id:
+        description: "Workflow run ID to pull artifact from"
+        required: true
+      artifact_name:
+        description: "Artifact name to download"
         required: true
       part_size_mb:
-        description: "Chunk size in MB (recommend 1024 = 1GB)"
+        description: "Chunk size in MB (e.g. 1024)"
         required: false
         default: "1024"
       artifact_prefix:
-        description: "Prefix for artifact name (e.g., macos_Monterey_12.7.6.iso)"
+        description: "Prefix for output chunk artifacts"
         required: true
 
-permissions:
-  contents: read
-
 jobs:
-  split-and-upload:
-    name: Split & Upload
+  download-split-upload:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout (not strictly required, but keeps paths consistent)
-        uses: actions/checkout@v4
+      - name: Download artifact from another run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.inputs.run_id }}
+          name: ${{ github.event.inputs.artifact_name }}
+          path: downloaded
 
-      - name: Validate inputs & show disk
-        shell: bash
+      - name: Confirm file downloaded
         run: |
-          set -euo pipefail
-          echo "file_path=${{ github.event.inputs.file_path }}"
-          echo "part_size_mb=${{ github.event.inputs.part_size_mb }}"
-          echo "artifact_prefix=${{ github.event.inputs.artifact_prefix }}"
-          df -h .
-          if [ ! -f "${{ github.event.inputs.file_path }}" ]; then
-            echo "❌ File not found: ${{ github.event.inputs.file_path }}"
-            exit 1
-          fi
+          echo "Downloaded files:"
+          ls -lh downloaded
+          FILE=$(ls downloaded)
+          echo "FILE_NAME=$FILE" >> $GITHUB_ENV
 
-      - name: Make working directory
-        run: mkdir -p split_out
-
-      # Use `split` to create 1GB-ish chunks; you can change to 2048m etc.
-      - name: Split file into parts
-        shell: bash
+      - name: Split artifact into parts
         run: |
-          set -euo pipefail
-          FILE="${{ github.event.inputs.file_path }}"
-          SIZE="${{ github.event.inputs.part_size_mb }}m"
-          PREFIX="$(basename "${{ github.event.inputs.artifact_prefix }}")"
-          # Output pattern like: macos.iso.part_aa, macos.iso.part_ab, ...
-          split -b "$SIZE" -d -a 3 "$FILE" "split_out/${PREFIX}.part_"
-          echo "Created parts:"
-          ls -lh split_out
+          mkdir parts
+          split -b $(( ${{ github.event.inputs.part_size_mb }} * 1024 * 1024 )) \
+            "downloaded/$FILE_NAME" \
+            "parts/${{ github.event.inputs.artifact_prefix }}.part_"
+          ls -lh parts
 
-      # Option A: Upload *all parts* as a single artifact (one zip)
-      # (Fast to trigger, but yields one big ZIP again on download — not ideal for flaky links)
-      # - name: Upload all parts as one artifact (NOT recommended for flaky networks)
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: ${{ github.event.inputs.artifact_prefix }}-parts
-      #     path: split_out/*
-      #     retention-days: 7
-
-      # Option B (recommended): Upload each part as a separate artifact.
-      # This lets you download in smaller, independent chunks.
-      - name: Create file list
-        id: list
-        shell: bash
-        run: |
-          ls -1 split_out | sed 's|^|split_out/|' > parts.txt
-          echo "count=$(wc -l < parts.txt)" >> $GITHUB_OUTPUT
-
-      - name: Upload parts individually
-        # This action step loops in bash to emit multiple upload steps dynamically.
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS= read -r PART; do
-            NAME="$(basename "$PART")"
-            echo "Uploading $NAME"
-            gh release --help >/dev/null 2>&1 || true
-            # Use upload-artifact to publish each part separately
-            node -e '
-              (async () => {
-                const core = await import("@actions/core");
-              })().catch(() => {});' >/dev/null 2>&1 || true
-            echo "::group::upload $NAME"
-            echo "::endgroup::"
-            echo "::notice::Uploading $NAME"
-            # Call upload-artifact via the composite runner
-          done < parts.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # The GitHub CLI loop above only prints; we need proper uploads.
-      # We cannot dynamically add multiple steps, so we re-run with a small shell loop using upload-artifact v4.
-      - name: Upload parts (robust)
+      - name: Upload chunked parts (one artifact)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.artifact_prefix }}-parts
-          path: split_out/*
-          if-no-files-found: error
+          path: parts/*
           retention-days: 7
