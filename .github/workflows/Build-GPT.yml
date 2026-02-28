@@ -1,0 +1,240 @@
+name: Build Full Installer ISO/DMG image (Chunked Upload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: 'Select a macOS version to build'
+        required: true
+        type: choice
+        options:
+          - 'Tahoe'
+          - 'Sequoia'
+          - 'Sonoma'
+          - 'Ventura'
+          - 'Monterey'
+          - 'Big Sur'
+          - 'Catalina'
+          - 'Mojave'
+          - 'High Sierra'
+          - 'Sierra'
+          - 'El Capitan'
+          - 'Yosemite'
+          - 'Mavericks'
+          - 'Mountain Lion'
+          - 'Lion'
+      image_format:
+        description: 'Select image format: iso for virtual machines, dmg for flash to USB drive'
+        required: true
+        type: choice
+        options:
+          - 'iso'
+          - 'dmg'
+      chunk_size_gb:
+        description: 'Chunk size in GB (2–4 recommended)'
+        required: false
+        default: '3'
+        type: string
+
+jobs:
+  build-macos-image:
+    runs-on: macos-15-intel
+    timeout-minutes: 70
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: System Information
+        run: |
+          echo "Runner OS: $(sw_vers -productName) $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          echo ""
+          df -h $(mktemp)
+          echo ""
+          echo "RAM: $(top -l 1 | grep PhysMem || true)"
+          echo ""
+          echo "CPU: $(sysctl -n machdep.cpu.brand_string)"
+
+      - name: Create macOS image
+        id: create_image
+        # If the build fails, we stop and do not attempt uploads.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.image_format }}" = "iso" ]; then
+            sudo bash mkmaciso "${{ github.event.inputs.macos_version }}" iso
+            # pick the only ISO
+            IMAGE_FILE="$(ls -1 *.iso | head -n1)"
+          else
+            sudo bash mkmaciso "${{ github.event.inputs.macos_version }}" dmg
+            # the script appears to output *.dmg.img
+            IMAGE_FILE="$(ls -1 *.dmg.img | head -n1)"
+          fi
+
+          if [ -z "${IMAGE_FILE:-}" ] || [ ! -f "$IMAGE_FILE" ]; then
+            echo "No image file produced." >&2
+            exit 1
+          fi
+
+          echo "image_name=$(basename "$IMAGE_FILE")" >> "$GITHUB_OUTPUT"
+          echo "image_file=$IMAGE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Compute checksum and manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          IMAGE_FILE="${{ steps.create_image.outputs.image_file }}"
+          IMAGE_NAME="${{ steps.create_image.outputs.image_name }}"
+
+          echo "Computing SHA-256 checksum for $IMAGE_FILE ..."
+          shasum -a 256 "$IMAGE_FILE" | awk '{print $1}' > "${IMAGE_NAME}.sha256"
+          echo "checksum=$(cat "${IMAGE_NAME}.sha256")" >> "$GITHUB_OUTPUT"
+
+          echo "Generating manifest ..."
+          {
+            echo "image_name=$IMAGE_NAME"
+            echo "image_bytes=$(stat -f%z "$IMAGE_FILE")"
+            echo "sha256=$(cat "${IMAGE_NAME}.sha256")"
+          } > "${IMAGE_NAME}.manifest.txt"
+
+      - name: Split image into chunks
+        id: split
+        run: |
+          set -euo pipefail
+          IMAGE_FILE="${{ steps.create_image.outputs.image_file }}"
+          IMAGE_NAME="${{ steps.create_image.outputs.image_name }}"
+          # sanitize chunk size to integer
+          CHUNK_GB="${{ github.event.inputs.chunk_size_gb }}"
+          # default to 3GB if input is empty/non-numeric
+          if ! [[ "$CHUNK_GB" =~ ^[0-9]+$ ]] || [ "$CHUNK_GB" -le 0 ]; then
+            CHUNK_GB=3
+          fi
+          CHUNK_BYTES="$(( CHUNK_GB * 1024 * 1024 * 1024 ))"
+
+          echo "Splitting $IMAGE_FILE into ${CHUNK_GB}GB parts ..."
+          # Output parts will look like: <image>.part-aa, -ab, -ac, ...
+          split -b "${CHUNK_BYTES}" -a 2 -d "$IMAGE_FILE" "${IMAGE_NAME}.part-"
+          PART_COUNT=$(ls -1 "${IMAGE_NAME}.part-"* | wc -l | tr -d ' ')
+          echo "Created $PART_COUNT parts."
+          echo "part_count=$PART_COUNT" >> "$GITHUB_OUTPUT"
+
+          # Write a reassembly helper script for macOS/Linux users
+          cat > REASSEMBLE.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          IMAGE_BASENAME="$1"
+          cat "${IMAGE_BASENAME}.part-"* > "${IMAGE_BASENAME}"
+          echo "Wrote ${IMAGE_BASENAME}"
+          # Optional: verify checksum if <basename>.sha256 is present
+          if [ -f "${IMAGE_BASENAME}.sha256" ]; then
+            echo "Verifying SHA-256 checksum..."
+            # macOS uses shasum; Linux may use sha256sum
+            if command -v shasum >/dev/null 2>&1; then
+              calc=$(shasum -a 256 "${IMAGE_BASENAME}" | awk '{print $1}')
+            else
+              calc=$(sha256sum "${IMAGE_BASENAME}" | awk '{print $1}')
+            fi
+            want=$(cat "${IMAGE_BASENAME}.sha256")
+            if [ "$calc" != "$want" ]; then
+              echo "Checksum mismatch! expected=$want got=$calc" >&2
+              exit 2
+            fi
+            echo "Checksum OK"
+          fi
+          EOF
+          chmod +x REASSEMBLE.sh
+
+          # Windows reassembly instructions
+          cat > REASSEMBLE.ps1 <<'EOF'
+          Param(
+            [Parameter(Mandatory=$true)]
+            [string]$ImageBaseName
+          )
+          $outFile = "$ImageBaseName"
+          $parts = Get-ChildItem "$($ImageBaseName).part-*"
+          if ($parts.Count -eq 0) {
+            Write-Error "No parts found for $ImageBaseName"
+            exit 1
+          }
+          # Stream-safe concatenation
+          $out = [System.IO.File]::OpenWrite($outFile)
+          foreach ($p in $parts | Sort-Object Name) {
+            $in = [System.IO.File]::OpenRead($p.FullName)
+            $in.CopyTo($out)
+            $in.Dispose()
+          }
+          $out.Dispose()
+          Write-Host "Wrote $outFile"
+
+          $shaFile = "$ImageBaseName.sha256"
+          if (Test-Path $shaFile) {
+            Write-Host "Verifying SHA-256 checksum..."
+            $calc = (Get-FileHash -Path $outFile -Algorithm SHA256).Hash.ToLower()
+            $want = (Get-Content $shaFile).Trim().ToLower()
+            if ($calc -ne $want) {
+              Write-Error "Checksum mismatch! expected=$want got=$calc"
+              exit 2
+            }
+            Write-Host "Checksum OK"
+          }
+          EOF
+
+      - name: Upload parts (single artifact set)
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.create_image.outputs.image_name }}-parts
+          path: |
+            ${{ steps.create_image.outputs.image_name }}.part-*
+            ${{ steps.create_image.outputs.image_name }}.sha256
+            ${{ steps.create_image.outputs.image_name }}.manifest.txt
+            REASSEMBLE.sh
+            REASSEMBLE.ps1
+          compression-level: 0
+          retention-days: 15
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          OUTCOME="${{ job.status }}"
+          IMG="${{ steps.create_image.outputs.image_name }}"
+          PARTS="${{ steps.split.outputs.part_count || '0' }}"
+          CHECKSUM="$(cat "${IMG}.sha256" 2>/dev/null || echo 'n/a')"
+          if [ "$OUTCOME" != "success" ]; then
+            {
+              echo "## Download macOS failed"
+              echo ""
+              echo "> [!WARNING]"
+              echo "> This runner may have network issues. Please **re-run the workflow** to try a different runner."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## ✅ Successfully built and chunked \`$IMG\`"
+            echo ""
+            echo "- Total parts: **${PARTS}**"
+            echo "- SHA-256: \`${CHECKSUM}\`"
+            echo ""
+            echo "### 📥 How to download"
+            echo "Using GitHub CLI (recommended, auto-resume):"
+            echo '```powershell'
+            echo "gh auth login"
+            echo "gh run download ${{ github.run_id }} --repo ${{ github.repository }} --name \"${IMG}-parts\" --dir ."
+            echo '```'
+            echo ""
+            echo "### 🧩 How to reassemble"
+            echo "**Windows (PowerShell):**"
+            echo '```powershell'
+            echo "./REASSEMBLE.ps1 -ImageBaseName '${IMG}'"
+            echo '```'
+            echo ""
+            echo "**macOS/Linux:**"
+            echo '```bash'
+            echo "chmod +x REASSEMBLE.sh && ./REASSEMBLE.sh '${IMG}'"
+            echo '```'
+            echo ""
+            echo "> After reassembly, you will have the original file:"
+            echo "> - ISO: \`${IMG}\` for Proxmox/QEMU/VMware/VirtualBox"
+            echo "> - DMG(IMG): \`${IMG}\` for USB flashing or VM (convert as needed)."
+          } >> "$GITHUB_STEP_SUMMARY"
