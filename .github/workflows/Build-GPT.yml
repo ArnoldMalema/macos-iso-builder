@@ -179,18 +179,20 @@ jobs:
           }
           EOF
 
-      - name: Upload parts (single artifact set)
-        uses: actions/upload-artifact@v5
-        with:
-          name: ${{ steps.create_image.outputs.image_name }}-parts
-          path: |
-            ${{ steps.create_image.outputs.image_name }}.part-*
-            ${{ steps.create_image.outputs.image_name }}.sha256
-            ${{ steps.create_image.outputs.image_name }}.manifest.txt
-            REASSEMBLE.sh
-            REASSEMBLE.ps1
-          compression-level: 0
-          retention-days: 15
+      - name: Upload chunked artifacts (each chunk separately)
+        if: steps.create_image.outcome == 'success'
+        run: |
+          IMAGE_NAME="${{ steps.create_image.outputs.image_name }}"
+          for part in ${IMAGE_NAME}.part-*; do
+            echo "Uploading $part ..."
+            gh api \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/${{ github.repository }}/actions/artifacts \
+              -f name="$part" \
+              -F file=@"$part"
+          done
+
 
       - name: Summary
         if: always()
