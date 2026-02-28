@@ -94,31 +94,42 @@ jobs:
             echo "image_format=${{ github.event.inputs.image_format }}"
           } > "${IMAGE_NAME}.manifest.txt"
 
-      - name: Split into 2GB chunks (max allowed for Releases)
+      - name: Split into chunks (<2 GiB for Releases)
         id: split
         run: |
           set -euo pipefail
           IMAGE_FILE="${{ steps.create_image.outputs.image_file }}"
           IMAGE_NAME="${{ steps.create_image.outputs.image_name }}"
-          # sanitize and clamp chunk size to 2 GB (GitHub Release asset limit)
+
+          # User input in GB (optional), but we enforce GitHub's strict <2 GiB rule
           REQ_GB="${{ github.event.inputs.chunk_size_gb }}"
           if ! [[ "$REQ_GB" =~ ^[0-9]+$ ]] || [ "$REQ_GB" -le 0 ]; then
             REQ_GB=2
           fi
-          if [ "$REQ_GB" -gt 2 ]; then
-            echo "Requested chunk size ${REQ_GB}GB > 2GB; clamping to 2GB for Releases."
-            REQ_GB=2
-          fi
-          CHUNK_BYTES="$(( REQ_GB * 1024 * 1024 * 1024 ))"
 
-          echo "Splitting $IMAGE_FILE into ${REQ_GB}GB parts ..."
-          # Numeric suffixes: part-00, part-01, ...
+          # Compute requested bytes in GiB
+          REQ_BYTES="$(( REQ_GB * 1024 * 1024 * 1024 ))"
+
+          # GitHub Release asset limit is STRICTLY LESS THAN 2 GiB
+          MAX_BYTES="$(( 2 * 1024 * 1024 * 1024 - 1024 * 1024 ))"  # 2 GiB - 1 MiB = 2,146,435,072 B (2047 MiB)
+
+          # Final chunk size in bytes (min(requested, MAX_BYTES))
+          if [ "$REQ_BYTES" -gt "$MAX_BYTES" ]; then
+            CHUNK_BYTES="$MAX_BYTES"
+            echo "Requested chunk size >= 2 GiB; clamped to 2047 MiB (${CHUNK_BYTES} bytes) to satisfy Releases limit."
+          else
+            CHUNK_BYTES="$REQ_BYTES"
+          fi
+
+          echo "Splitting $IMAGE_FILE into pieces of ${CHUNK_BYTES} bytes (<2 GiB each)…"
+          # Numeric suffixes: part-00, part-01, …
           split -b "${CHUNK_BYTES}" -a 2 -d "$IMAGE_FILE" "${IMAGE_NAME}.part-"
+
           PART_COUNT=$(ls -1 "${IMAGE_NAME}.part-"* | wc -l | tr -d ' ')
           echo "Created $PART_COUNT parts."
           echo "part_count=$PART_COUNT" >> "$GITHUB_OUTPUT"
 
-          # Reassembly script (bash)
+          # Reassembly helpers (unchanged)
           cat > REASSEMBLE.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -146,7 +157,6 @@ jobs:
           EOF
           chmod +x REASSEMBLE.sh
 
-          # Reassembly script (PowerShell)
           cat > REASSEMBLE.ps1 <<'EOF'
           Param(
             [Parameter(Mandatory=$true)]
