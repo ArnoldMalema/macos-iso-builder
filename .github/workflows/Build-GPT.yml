@@ -1,4 +1,4 @@
-name: Build Full Installer ISO/DMG image (Chunked Upload)
+name: Build Full Installer ISO/DMG image (Release, Chunked)
 
 on:
   workflow_dispatch:
@@ -31,9 +31,9 @@ on:
           - 'iso'
           - 'dmg'
       chunk_size_gb:
-        description: 'Chunk size in GB (2–4 recommended)'
+        description: 'Chunk size in GB (max 2 GB for GitHub Releases)'
         required: false
-        default: '3'
+        default: '2'
         type: string
 
 jobs:
@@ -56,18 +56,15 @@ jobs:
           echo ""
           echo "CPU: $(sysctl -n machdep.cpu.brand_string)"
 
-      - name: Create macOS image
+      - name: Build macOS image
         id: create_image
-        # If the build fails, we stop and do not attempt uploads.
         run: |
           set -euo pipefail
           if [ "${{ github.event.inputs.image_format }}" = "iso" ]; then
             sudo bash mkmaciso "${{ github.event.inputs.macos_version }}" iso
-            # pick the only ISO
             IMAGE_FILE="$(ls -1 *.iso | head -n1)"
           else
             sudo bash mkmaciso "${{ github.event.inputs.macos_version }}" dmg
-            # the script appears to output *.dmg.img
             IMAGE_FILE="$(ls -1 *.dmg.img | head -n1)"
           fi
 
@@ -76,8 +73,8 @@ jobs:
             exit 1
           fi
 
-          echo "image_name=$(basename "$IMAGE_FILE")" >> "$GITHUB_OUTPUT"
           echo "image_file=$IMAGE_FILE" >> "$GITHUB_OUTPUT"
+          echo "image_name=$(basename "$IMAGE_FILE")" >> "$GITHUB_OUTPUT"
 
       - name: Compute checksum and manifest
         id: manifest
@@ -88,47 +85,52 @@ jobs:
 
           echo "Computing SHA-256 checksum for $IMAGE_FILE ..."
           shasum -a 256 "$IMAGE_FILE" | awk '{print $1}' > "${IMAGE_NAME}.sha256"
-          echo "checksum=$(cat "${IMAGE_NAME}.sha256")" >> "$GITHUB_OUTPUT"
 
-          echo "Generating manifest ..."
           {
             echo "image_name=$IMAGE_NAME"
             echo "image_bytes=$(stat -f%z "$IMAGE_FILE")"
             echo "sha256=$(cat "${IMAGE_NAME}.sha256")"
+            echo "macos_version=${{ github.event.inputs.macos_version }}"
+            echo "image_format=${{ github.event.inputs.image_format }}"
           } > "${IMAGE_NAME}.manifest.txt"
 
-      - name: Split image into chunks
+      - name: Split into 2GB chunks (max allowed for Releases)
         id: split
         run: |
           set -euo pipefail
           IMAGE_FILE="${{ steps.create_image.outputs.image_file }}"
           IMAGE_NAME="${{ steps.create_image.outputs.image_name }}"
-          # sanitize chunk size to integer
-          CHUNK_GB="${{ github.event.inputs.chunk_size_gb }}"
-          # default to 3GB if input is empty/non-numeric
-          if ! [[ "$CHUNK_GB" =~ ^[0-9]+$ ]] || [ "$CHUNK_GB" -le 0 ]; then
-            CHUNK_GB=3
+          # sanitize and clamp chunk size to 2 GB (GitHub Release asset limit)
+          REQ_GB="${{ github.event.inputs.chunk_size_gb }}"
+          if ! [[ "$REQ_GB" =~ ^[0-9]+$ ]] || [ "$REQ_GB" -le 0 ]; then
+            REQ_GB=2
           fi
-          CHUNK_BYTES="$(( CHUNK_GB * 1024 * 1024 * 1024 ))"
+          if [ "$REQ_GB" -gt 2 ]; then
+            echo "Requested chunk size ${REQ_GB}GB > 2GB; clamping to 2GB for Releases."
+            REQ_GB=2
+          fi
+          CHUNK_BYTES="$(( REQ_GB * 1024 * 1024 * 1024 ))"
 
-          echo "Splitting $IMAGE_FILE into ${CHUNK_GB}GB parts ..."
-          # Output parts will look like: <image>.part-aa, -ab, -ac, ...
+          echo "Splitting $IMAGE_FILE into ${REQ_GB}GB parts ..."
+          # Numeric suffixes: part-00, part-01, ...
           split -b "${CHUNK_BYTES}" -a 2 -d "$IMAGE_FILE" "${IMAGE_NAME}.part-"
           PART_COUNT=$(ls -1 "${IMAGE_NAME}.part-"* | wc -l | tr -d ' ')
           echo "Created $PART_COUNT parts."
           echo "part_count=$PART_COUNT" >> "$GITHUB_OUTPUT"
 
-          # Write a reassembly helper script for macOS/Linux users
+          # Reassembly script (bash)
           cat > REASSEMBLE.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
+          if [ $# -lt 1 ]; then
+            echo "Usage: $0 <ImageBaseName>" >&2
+            exit 1
+          fi
           IMAGE_BASENAME="$1"
           cat "${IMAGE_BASENAME}.part-"* > "${IMAGE_BASENAME}"
           echo "Wrote ${IMAGE_BASENAME}"
-          # Optional: verify checksum if <basename>.sha256 is present
           if [ -f "${IMAGE_BASENAME}.sha256" ]; then
             echo "Verifying SHA-256 checksum..."
-            # macOS uses shasum; Linux may use sha256sum
             if command -v shasum >/dev/null 2>&1; then
               calc=$(shasum -a 256 "${IMAGE_BASENAME}" | awk '{print $1}')
             else
@@ -144,28 +146,26 @@ jobs:
           EOF
           chmod +x REASSEMBLE.sh
 
-          # Windows reassembly instructions
+          # Reassembly script (PowerShell)
           cat > REASSEMBLE.ps1 <<'EOF'
           Param(
             [Parameter(Mandatory=$true)]
             [string]$ImageBaseName
           )
           $outFile = "$ImageBaseName"
-          $parts = Get-ChildItem "$($ImageBaseName).part-*"
+          $parts = Get-ChildItem "$($ImageBaseName).part-*" | Sort-Object Name
           if ($parts.Count -eq 0) {
             Write-Error "No parts found for $ImageBaseName"
             exit 1
           }
-          # Stream-safe concatenation
           $out = [System.IO.File]::OpenWrite($outFile)
-          foreach ($p in $parts | Sort-Object Name) {
+          foreach ($p in $parts) {
             $in = [System.IO.File]::OpenRead($p.FullName)
             $in.CopyTo($out)
             $in.Dispose()
           }
           $out.Dispose()
           Write-Host "Wrote $outFile"
-
           $shaFile = "$ImageBaseName.sha256"
           if (Test-Path $shaFile) {
             Write-Host "Verifying SHA-256 checksum..."
@@ -179,20 +179,53 @@ jobs:
           }
           EOF
 
-      - name: Upload chunked artifacts (each chunk separately)
-        if: steps.create_image.outcome == 'success'
+      - name: Ensure GitHub CLI is available
         run: |
+          set -e
+          gh --version || brew install gh
+
+      - name: Create or update release for this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        id: release
+        run: |
+          set -euo pipefail
+          TAG="build-${{ github.run_id }}"
+          TITLE="macOS ${{
+            github.event.inputs.macos_version
+          }} • ${{ steps.create_image.outputs.image_name }} • run ${{ github.run_id }}"
+          BODY="Auto-generated build for macOS ${{ github.event.inputs.macos_version }} (${{ github.event.inputs.image_format }}).
+          Triggered by workflow run ${{ github.run_id }}.
+          This release contains chunked parts (2GB max per asset), a checksum, a manifest, and reassembly scripts."
+
+          # Create if missing; otherwise do nothing
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+          else
+            gh release create "$TAG" -t "$TITLE" -n "$BODY"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload chunks and support files as release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.release.outputs.tag }}"
           IMAGE_NAME="${{ steps.create_image.outputs.image_name }}"
-          for part in ${IMAGE_NAME}.part-*; do
-            echo "Uploading $part ..."
-            gh api \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              /repos/${{ github.repository }}/actions/artifacts \
-              -f name="$part" \
-              -F file=@"$part"
+
+          # Upload parts
+          for f in ${IMAGE_NAME}.part-*; do
+            echo "Uploading $f ..."
+            gh release upload "$TAG" "$f" --clobber
           done
 
+          # Upload checksum, manifest, and helper scripts
+          for f in "${IMAGE_NAME}.sha256" "${IMAGE_NAME}.manifest.txt" REASSEMBLE.sh REASSEMBLE.ps1; do
+            echo "Uploading $f ..."
+            gh release upload "$TAG" "$f" --clobber
+          done
 
       - name: Summary
         if: always()
@@ -200,8 +233,12 @@ jobs:
           set -euo pipefail
           OUTCOME="${{ job.status }}"
           IMG="${{ steps.create_image.outputs.image_name }}"
-          PARTS="${{ steps.split.outputs.part_count || '0' }}"
+          TAG="${{ steps.release.outputs.tag }}"
+          REPO="${{ github.server_url }}/${{ github.repository }}"
+          REL_URL="${REPO}/releases/tag/${TAG}"
           CHECKSUM="$(cat "${IMG}.sha256" 2>/dev/null || echo 'n/a')"
+          PARTS="${{ steps.split.outputs.part_count || '0' }}"
+
           if [ "$OUTCOME" != "success" ]; then
             {
               echo "## Download macOS failed"
@@ -213,19 +250,21 @@ jobs:
           fi
 
           {
-            echo "## ✅ Successfully built and chunked \`$IMG\`"
+            echo "## ✅ Built and uploaded **${IMG}** as chunked Release assets"
             echo ""
-            echo "- Total parts: **${PARTS}**"
+            echo "- Release: ${REL_URL}"
+            echo "- Total parts: **${PARTS}** (2GB chunks, last may be smaller)"
             echo "- SHA-256: \`${CHECKSUM}\`"
             echo ""
-            echo "### 📥 How to download"
-            echo "Using GitHub CLI (recommended, auto-resume):"
+            echo "### 📥 Download (GitHub CLI, recommended)"
             echo '```powershell'
             echo "gh auth login"
-            echo "gh run download ${{ github.run_id }} --repo ${{ github.repository }} --name \"${IMG}-parts\" --dir ."
+            echo "gh release download ${TAG} --repo ${{ github.repository }} --dir . --pattern '${IMG}.part-*'"
+            echo "gh release download ${TAG} --repo ${{ github.repository }} --dir . --pattern '${IMG}.sha256'"
+            echo "gh release download ${TAG} --repo ${{ github.repository }} --dir . --pattern 'REASSEMBLE.ps1'"
             echo '```'
             echo ""
-            echo "### 🧩 How to reassemble"
+            echo "### 🧩 Reassemble"
             echo "**Windows (PowerShell):**"
             echo '```powershell'
             echo "./REASSEMBLE.ps1 -ImageBaseName '${IMG}'"
@@ -238,5 +277,5 @@ jobs:
             echo ""
             echo "> After reassembly, you will have the original file:"
             echo "> - ISO: \`${IMG}\` for Proxmox/QEMU/VMware/VirtualBox"
-            echo "> - DMG(IMG): \`${IMG}\` for USB flashing or VM (convert as needed)."
+            echo "> - DMG(IMG): \`${IMG}\` for USB flashing or VM (convert as needed)"
           } >> "$GITHUB_STEP_SUMMARY"
